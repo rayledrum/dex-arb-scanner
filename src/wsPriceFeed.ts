@@ -71,7 +71,7 @@ export async function subscribeRaydiumVaults(
     const vaultPks = newVaultAddrs.map(a => new PublicKey(a));
     const vaultAccs = await conn.getMultipleAccountsInfo(vaultPks);
     for (let i = 0; i < vaultPks.length; i++) {
-      if (vaultAccs[i]) {
+      if (vaultAccs[i] && vaultAccs[i]!.data.length >= 72) {
         const addr = newVaultAddrs[i];
         const raw = Number(vaultAccs[i]!.data.readBigUInt64LE(64));
         const info = vaultToPool.get(addr)!;
@@ -100,6 +100,7 @@ export async function subscribeRaydiumVaults(
     for (const { addr, info } of newPoolEntries) {
       const pk = new PublicKey(addr);
       const subId = conn.onAccountChange(pk, (acctInfo) => {
+        if (acctInfo.data.length < 72) return;
         const raw = Number(acctInfo.data.readBigUInt64LE(64));
         const [baseMint, quoteMint] = info.key.split('|');
         const isBaseVault = info.baseVault === addr;

@@ -1,0 +1,123 @@
+import { Connection, PublicKey } from '@solana/web3.js';
+import { fetchSolPrice, RaydiumPoolRaw } from './onchain';
+
+export interface PriceUpdate {
+  mint: string;
+  dex: string;
+  price: number;
+  liq: number;
+}
+
+type PriceCallback = (update: PriceUpdate) => void;
+
+const SOL_MINT = 'So11111111111111111111111111111111111111112';
+const USDC_MINT = 'EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v';
+
+export async function subscribeRaydiumVaults(
+  conn: Connection,
+  initialSolPrice: number,
+  onPrice: PriceCallback,
+  pools: RaydiumPoolRaw[],
+): Promise<() => void> {
+  let solPrice = initialSolPrice;
+
+  const solUpdater = setInterval(async () => {
+    try { solPrice = await fetchSolPrice(); } catch {}
+  }, 60_000);
+
+  const vaultToPool = new Map<string, { key: string; baseVault: string; quoteVault: string }>();
+  const allMints = new Set<string>();
+
+  for (const p of pools) {
+    vaultToPool.set(p.baseVault, { key: p.key, baseVault: p.baseVault, quoteVault: p.quoteVault });
+    vaultToPool.set(p.quoteVault, { key: p.key, baseVault: p.baseVault, quoteVault: p.quoteVault });
+    const [base, quote] = p.key.split('|');
+    allMints.add(base);
+    allMints.add(quote);
+  }
+
+  const vaultAddresses = [...vaultToPool.keys()];
+  const vaultPks = vaultAddresses.map(a => new PublicKey(a));
+
+  const mintPks = [...allMints].map(a => new PublicKey(a));
+  const mintAccounts = await conn.getMultipleAccountsInfo(mintPks);
+  const mintDecimals = new Map<string, number>();
+  for (let i = 0; i < mintPks.length; i++) {
+    if (mintAccounts[i]) {
+      mintDecimals.set(mintPks[i].toBase58(), mintAccounts[i]!.data.readUInt8(44));
+    }
+  }
+
+  const vaultAccounts = await conn.getMultipleAccountsInfo(vaultPks);
+  const vaultBalances = new Map<string, number>();
+
+  for (let i = 0; i < vaultPks.length; i++) {
+    if (vaultAccounts[i]) {
+      const addr = vaultAddresses[i];
+      const raw = Number(vaultAccounts[i]!.data.readBigUInt64LE(64));
+      const info = vaultToPool.get(addr)!;
+      const [baseMint, quoteMint] = info.key.split('|');
+      const isBaseVault = info.baseVault === addr;
+      const tokenMint = isBaseVault ? baseMint : quoteMint;
+      const decimals = mintDecimals.get(tokenMint) || 9;
+      vaultBalances.set(addr, raw / Math.pow(10, decimals));
+    }
+  }
+
+  for (const p of pools) {
+    const [baseMint, quoteMint] = p.key.split('|');
+    const baseBal = vaultBalances.get(p.baseVault) || 0;
+    const quoteBal = vaultBalances.get(p.quoteVault) || 0;
+    if (baseBal <= 0 || quoteBal <= 0) continue;
+
+    let price = 0, liq = 0;
+    if (quoteMint === SOL_MINT) {
+      price = (quoteBal / baseBal) * solPrice;
+      liq = quoteBal * solPrice;
+    } else if (quoteMint === USDC_MINT) {
+      price = quoteBal / baseBal;
+      liq = quoteBal;
+    } else continue;
+
+    onPrice({ mint: baseMint, dex: 'raydium', price, liq });
+  }
+
+  const subIds: number[] = [];
+  for (const [addr, info] of vaultToPool) {
+    const pk = new PublicKey(addr);
+    const subId = conn.onAccountChange(pk, (acctInfo) => {
+      const raw = Number(acctInfo.data.readBigUInt64LE(64));
+      const [baseMint, quoteMint] = info.key.split('|');
+      const isBaseVault = info.baseVault === addr;
+      const tokenMint = isBaseVault ? baseMint : quoteMint;
+      const decimals = mintDecimals.get(tokenMint) || 9;
+      const bal = raw / Math.pow(10, decimals);
+      vaultBalances.set(addr, bal);
+
+      const baseBal = vaultBalances.get(info.baseVault) || 0;
+      const quoteBal = vaultBalances.get(info.quoteVault) || 0;
+      if (baseBal <= 0 || quoteBal <= 0) return;
+
+      let price = 0, liq = 0;
+      if (quoteMint === SOL_MINT) {
+        price = (quoteBal / baseBal) * solPrice;
+        liq = quoteBal * solPrice;
+      } else if (quoteMint === USDC_MINT) {
+        price = quoteBal / baseBal;
+        liq = quoteBal;
+      } else return;
+
+      onPrice({ mint: baseMint, dex: 'raydium', price, liq });
+    }, 'confirmed');
+    subIds.push(subId);
+  }
+
+  console.log(`  ✓ WebSocket: ${subIds.length} Raydium vaults subscribed`);
+
+  return () => {
+    clearInterval(solUpdater);
+    for (const id of subIds) {
+      try { conn.removeAccountChangeListener(id); } catch {}
+    }
+  };
+}

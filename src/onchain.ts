@@ -207,7 +207,8 @@ export async function discoverRaydiumPools(maxPools = 50): Promise<RaydiumPoolRa
     const res = await fetch('https://api.raydium.io/v2/sdk/liquidity/mainnet.json', {
       signal: AbortSignal.timeout(15_000),
     });
-    const data: any = await res.json();
+    const body: any = await res.json();
+    const data = body?.official;
     if (!data || !Array.isArray(data)) return [];
 
     const official = data

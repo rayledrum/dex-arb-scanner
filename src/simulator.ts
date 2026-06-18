@@ -10,6 +10,14 @@ interface TradeRecord {
   profitSol: number;
   profitUsd: number;
   solPrice: number;
+  filled: boolean;
+}
+
+function slippageForLiq(liq: number): number {
+  if (liq < 10_000) return 1.0;
+  if (liq < 50_000) return 0.5;
+  if (liq < 200_000) return 0.3;
+  return 0.15;
 }
 
 export class ArbSimulator {
@@ -18,12 +26,12 @@ export class ArbSimulator {
   totalProfitSol = 0;
   maxDrawdown = 0;
   peakCapital = 10;
-  minSpread = 0.5;    // minimum spread to trade (%)
-  maxSpread = 3;      // max credible spread (% — reject fake data)
-  maxTradeFrac = 0.2; // max 20% of capital per trade
-  feeRate = 0.0006;   // 0.06% total fees (DEX + Jito)
-  slippage = 0.1;     // 0.1% slippage (Jito bundles land atomically)
-  minLiq = 2000;      // minimum liquidity ($)
+  minSpread = 0.7;
+  maxSpread = 5;
+  maxTradeFrac = 0.1;
+  feeRate = 0.0006;
+  jitoTipSol = 0.001;
+  minLiq = 2000;
 
   evaluate(opps: ArbOpportunity[], solPrice: number): string[] {
     const lines: string[] = [];
@@ -33,25 +41,26 @@ export class ArbSimulator {
       const minLiq = Math.min(opp.liqA, opp.liqB);
       if (minLiq < this.minLiq) continue;
 
-      // Determine direction
+      // Simulate competition: 70% fill rate
+      if (Math.random() > 0.7) continue;
+
       const buyOn = opp.priceA < opp.priceB ? opp.dexA : opp.dexB;
       const sellOn = opp.priceA < opp.priceB ? opp.dexB : opp.dexA;
       const spread = opp.spreadPct;
 
-      // Fee-adjusted net profit (spread - fees - slippage)
-      const netSpread = spread - this.feeRate * 100 - this.slippage;
+      const slippage = slippageForLiq(minLiq);
+      const netSpread = spread - this.feeRate * 100 - slippage;
       if (netSpread <= 0) continue;
 
-      // Trade size: cap % of capital, also cap at 5% of liquidity
       const sizeFromCap = this.capitalSol * this.maxTradeFrac;
-      const sizeFromLiq = minLiq / solPrice * 0.05;
-      const tradeSizeSol = Math.min(sizeFromCap, sizeFromLiq, 5); // max 5 SOL per trade
+      const sizeFromLiq = minLiq / solPrice * 0.03;
+      const tradeSizeSol = Math.min(sizeFromCap, sizeFromLiq, 5);
       if (tradeSizeSol < 0.05) continue;
 
       const grossProfitSol = tradeSizeSol * (netSpread / 100);
-      const profitSol = Math.max(grossProfitSol, 0.00001);
+      const profitSol = Math.max(grossProfitSol - this.jitoTipSol, 0);
+      if (profitSol <= 0) continue;
 
-      // Execute
       this.capitalSol += profitSol;
       this.totalProfitSol += profitSol;
       if (this.capitalSol > this.peakCapital) this.peakCapital = this.capitalSol;
@@ -60,15 +69,11 @@ export class ArbSimulator {
 
       const time = new Date().toLocaleTimeString();
       this.trades.push({
-        time,
-        token: opp.symbol,
-        dexBuy: buyOn,
-        dexSell: sellOn,
-        spread,
-        sizeSol: tradeSizeSol,
-        profitSol,
-        profitUsd: profitSol * solPrice,
-        solPrice,
+        time, token: opp.symbol,
+        dexBuy: buyOn, dexSell: sellOn,
+        spread, sizeSol: tradeSizeSol,
+        profitSol, profitUsd: profitSol * solPrice, solPrice,
+        filled: true,
       });
 
       const pnlPct = (this.totalProfitSol / 10 * 100).toFixed(2);

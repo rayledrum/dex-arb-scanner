@@ -202,33 +202,82 @@ export interface RaydiumPoolRaw {
   liquidityUsd: number;
 }
 
-export async function discoverRaydiumPools(maxPools = 50): Promise<RaydiumPoolRaw[]> {
+/** Raydium v4 AMM pool offset constants */
+const RAYDIUM_V4_PROGRAM = '675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8';
+
+/**
+ * Read baseVault + quoteVault from a Raydium v4 AMM pool account.
+ * Layout: poolCoinVault at offset 192, poolPcVault at offset 224 (Pubkey = 32 bytes each)
+ */
+function parseRaydiumVaults(poolData: Buffer): { baseVault: string; quoteVault: string } | null {
   try {
-    const res = await fetch('https://api.raydium.io/v2/sdk/liquidity/mainnet.json', {
-      signal: AbortSignal.timeout(15_000),
-    });
-    const body: any = await res.json();
-    const data = body?.official;
-    if (!data || !Array.isArray(data)) return [];
-
-    const official = data
-      .filter((p: any) => p && p.baseMint && p.quoteMint && p.baseVault && p.quoteVault)
-      .map((p: any) => ({
-        key: `${p.baseMint}|${p.quoteMint}`,
-        baseMint: p.baseMint,
-        quoteMint: p.quoteMint,
-        poolId: p.id,
-        baseVault: p.baseVault,
-        quoteVault: p.quoteVault,
-        liquidityUsd: Number(p.liquidity?.usd) || 0,
-      }))
-      .filter(p => [SOL_MINT, USDC_MINT].includes(p.quoteMint))
-      .sort((a, b) => b.liquidityUsd - a.liquidityUsd);
-
-    return official.slice(0, maxPools);
+    const baseVault = new PublicKey(poolData.subarray(192, 224)).toBase58();
+    const quoteVault = new PublicKey(poolData.subarray(224, 256)).toBase58();
+    return { baseVault, quoteVault };
   } catch {
-    return [];
+    return null;
   }
+}
+
+export async function discoverRaydiumPools(
+  conn: Connection,
+  seedMints: string[],
+  maxPools = 50,
+): Promise<RaydiumPoolRaw[]> {
+  const seenPoolIds = new Set<string>();
+  const foundPools: { key: string; poolId: string }[] = [];
+
+  // Scan seed mints in parallel (fast, rate limit is per-IP not per-call)
+  const results = await Promise.allSettled(
+    seedMints.map(mint =>
+      fetch(`https://api.dexscreener.com/latest/dex/search?q=${mint}`)
+        .then(r => r.json())
+        .then(d => (d.pairs || []).filter((p: any) =>
+          p.chainId === 'solana' && p.dexId === 'raydium' &&
+          [SOL_MINT, USDC_MINT].includes(p.quoteToken?.address || '')
+        ))
+    )
+  );
+
+  for (const result of results) {
+    if (result.status !== 'fulfilled') continue;
+    for (const p of result.value) {
+      const poolId: string = p.pairAddress || '';
+      if (!poolId || seenPoolIds.has(poolId)) continue;
+      seenPoolIds.add(poolId);
+      const baseMint: string = p.baseToken?.address || '';
+      const quoteMint: string = p.quoteToken?.address || '';
+      if (!baseMint || !quoteMint) continue;
+      foundPools.push({ key: `${baseMint}|${quoteMint}`, poolId });
+    }
+  }
+
+  // Read vault addresses on-chain (single batch RPC call)
+  const poolsWithVaults: RaydiumPoolRaw[] = [];
+  for (let i = 0; i < foundPools.length && poolsWithVaults.length < maxPools; i += 15) {
+    const batch = foundPools.slice(i, i + 15);
+    const pks = batch.map(p => new PublicKey(p.poolId));
+    const accounts = await conn.getMultipleAccountsInfo(pks);
+
+    for (let j = 0; j < batch.length; j++) {
+      const acc = accounts[j];
+      if (!acc || acc.data.length < 256) continue;
+      const vaults = parseRaydiumVaults(acc.data);
+      if (!vaults) continue;
+      const [baseMint, quoteMint] = batch[j].key.split('|');
+      poolsWithVaults.push({
+        key: batch[j].key,
+        baseMint,
+        quoteMint,
+        poolId: batch[j].poolId,
+        baseVault: vaults.baseVault,
+        quoteVault: vaults.quoteVault,
+        liquidityUsd: 0,
+      });
+    }
+  }
+
+  return poolsWithVaults.slice(0, maxPools);
 }
 
 export async function fetchSolPrice(): Promise<number> {
@@ -250,3 +299,5 @@ export async function fetchSolPrice(): Promise<number> {
   }
   return 150;
 }
+
+function sleep(ms: number) { return new Promise(r => setTimeout(r, ms)); }

@@ -1,4 +1,5 @@
-import { Connection } from '@solana/web3.js';
+import fs from 'fs';
+import { Connection, PublicKey } from '@solana/web3.js';
 import { fetchPools, findArb, formatSpread, ArbOpportunity } from './poolcheck';
 import { TokenTracker, SEED_TOKENS } from './trackedTokens';
 import { getHeldTokens, getTradeTokens, fetchSymbol } from './discover';
@@ -8,6 +9,16 @@ import {
 } from './onchain';
 import { ArbSimulator } from './simulator';
 import { subscribeRaydiumVaults, PriceUpdate } from './wsPriceFeed';
+
+const POOLS_CACHE = 'pools.json';
+
+function loadPoolCache(): any[] {
+  try { return JSON.parse(fs.readFileSync(POOLS_CACHE, 'utf-8')); } catch { return []; }
+}
+
+function savePoolCache(pools: any[]) {
+  try { fs.writeFileSync(POOLS_CACHE, JSON.stringify(pools, null, 2)); } catch {}
+}
 
 // ── Real-time shared price cache ──────────────────────────
 interface CachedPrice { price: number; liq: number; ts: number }
@@ -155,8 +166,19 @@ async function main() {
 
   console.log(`  Settings: minLiq=$${MIN_LIQ}  minSpread=${MIN_SPREAD}%\n`);
 
-  // Discover top Raydium pools for real-time WS subscriptions
-  const discoveredPools = await discoverRaydiumPools(50);
+  // Discover Raydium pools — try cache first, then auto-discover
+  let cachedPools = loadPoolCache();
+  let discoveredPools: any[] = [];
+
+  if (cachedPools.length >= 8) {
+    discoveredPools = cachedPools;
+    console.log(`  Loaded ${cachedPools.length} Raydium pools from cache`);
+  } else {
+    discoveredPools = await discoverRaydiumPools(connection, SEED_TOKENS, 50);
+    savePoolCache(discoveredPools);
+    console.log(`  Discovered ${discoveredPools.length} Raydium pools (saved to pools.json)`);
+  }
+
   const allWsPools = [...Object.entries(KNOWN_RAYDIUM_POOLS).map(([key, p]) => ({
     key,
     baseMint: key.split('|')[0],
@@ -175,16 +197,18 @@ async function main() {
     return true;
   });
 
-  console.log(`  Raydium WS pools: ${dedupedPools.length} (${discoveredPools.length} auto-discovered)`);
+  console.log(`  Raydium WS pools: ${dedupedPools.length} tracked`);
 
   const sim = new ArbSimulator();
 
   // Phase 3b: WebSocket price feed (real-time)
-  let wsCleanup: (() => void) | undefined;
-  await subscribeRaydiumVaults(connection, solPrice, (upd: PriceUpdate) => {
+  let wsManager: { cleanup: () => void; addPools: (pools: any[]) => Promise<void> } | undefined;
+  wsManager = await subscribeRaydiumVaults(connection, solPrice, (upd: PriceUpdate) => {
     updateRtPrice(upd.mint, upd.dex, upd.price, upd.liq);
     if (sim) checkAndTrade(upd.mint, tracker, sim, solPrice);
-  }, dedupedPools).then(fn => wsCleanup = fn);
+  }, dedupedPools);
+
+  const subscribedPoolIds = new Set(dedupedPools.map(p => p.poolId));
 
   // Pre-cache DexScreener prices for WS-tracked tokens so arb detection fires instantly
   const wsTrackedMints = new Set<string>();
@@ -206,7 +230,7 @@ async function main() {
   console.log('  ✓ On-chain + DexScreener price feeds');
   console.log('  ✓ WebSocket: real-time Raydium vault subscriptions');
   console.log('  ✓ Paper trader: 10 SOL initial\n');
-  console.log('  Spreads update via WebSocket + 15s poll.\n');
+  console.log('  Spreads update via WebSocket + 8s cycle.\n');
 
   // DexScreener cache to avoid repeated calls
   const dsCache = new Map<string, { data: any[]; ts: number }>();
@@ -229,6 +253,8 @@ async function main() {
     });
 
     const batch = sorted.slice(checkIndex % Math.max(sorted.length, 1), (checkIndex % Math.max(sorted.length, 1)) + PER_CYCLE);
+
+    const newRaydiumPoolIds: string[] = [];
 
     for (let bi = 0; bi < batch.length; bi++) {
       const t = batch[bi];
@@ -258,6 +284,14 @@ async function main() {
         updateRtPrice(p.baseMint, p.dex, p.priceUsd, p.liquidityUsd);
       }
 
+      // Track newly discovered Raydium pools for WS subscription
+      for (const p of pools) {
+        if (p.dex === 'raydium' && p.pairAddress && !subscribedPoolIds.has(p.pairAddress)) {
+          subscribedPoolIds.add(p.pairAddress);
+          newRaydiumPoolIds.push(p.pairAddress);
+        }
+      }
+
       const opps = findArb(pools, MIN_LIQ, MIN_SPREAD);
       const maxSpread = opps.length > 0 ? Math.max(...opps.map(o => o.spreadPct)) : 0;
       const maxLiq = opps.length > 0
@@ -266,6 +300,48 @@ async function main() {
       tracker.update(t.mint, pools.length, maxSpread, maxLiq);
       all.push(...opps);
     }
+
+    // Subscribe to newly discovered Raydium pools for real-time WS updates
+    if (newRaydiumPoolIds.length > 0 && wsManager) {
+      const pks = newRaydiumPoolIds.map(id => new PublicKey(id));
+      const poolAccounts = await connection.getMultipleAccountsInfo(pks);
+      const newPools: any[] = [];
+
+      for (let i = 0; i < poolAccounts.length; i++) {
+        const acc = poolAccounts[i];
+        if (!acc || acc.data.length < 256) continue;
+        try {
+          const coinMint = new PublicKey(acc.data.subarray(128, 160)).toBase58();
+          const pcMint = new PublicKey(acc.data.subarray(160, 192)).toBase58();
+          const coinVault = new PublicKey(acc.data.subarray(192, 224)).toBase58();
+          const pcVault = new PublicKey(acc.data.subarray(224, 256)).toBase58();
+          // Determine orientation: quote should be SOL or USDC
+          const [baseMint, quoteMint, baseVault, quoteVault] =
+            pcMint === 'So11111111111111111111111111111111111111112' || pcMint === 'EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v'
+              ? [coinMint, pcMint, coinVault, pcVault]
+              : [pcMint, coinMint, pcVault, coinVault];
+          if (quoteMint !== 'So11111111111111111111111111111111111111112' && quoteMint !== 'EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v') continue;
+          newPools.push({
+            key: `${baseMint}|${quoteMint}`,
+            baseMint, quoteMint,
+            poolId: newRaydiumPoolIds[i],
+            baseVault, quoteVault,
+            liquidityUsd: 0,
+          });
+        } catch {}
+      }
+
+      if (newPools.length > 0) {
+        await wsManager.addPools(newPools);
+        // Update cache for next startup
+        const cache = loadPoolCache();
+        const cacheIds = new Set(cache.map((p: any) => p.poolId));
+        const fresh = newPools.filter((p: any) => !cacheIds.has(p.poolId));
+        if (fresh.length > 0) savePoolCache([...cache, ...fresh]);
+        console.log(`  ◇ +${newPools.length} WS pools (${subscribedPoolIds.size} known)`);
+      }
+    }
+
     checkIndex = (checkIndex + PER_CYCLE) % Math.max(sorted.length, 1);
 
     all.sort((a, b) => b.spreadPct - a.spreadPct);

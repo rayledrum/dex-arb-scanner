@@ -229,7 +229,7 @@ async function main() {
 
   console.log('  ✓ On-chain + DexScreener price feeds');
   console.log('  ✓ WebSocket: real-time Raydium vault subscriptions');
-  console.log('  ✓ Paper trader: 10 SOL initial\n');
+  console.log('  ✓ Paper trader: 4 SOL initial\n');
   console.log('  Spreads update via WebSocket + 8s cycle.\n');
 
   // DexScreener cache to avoid repeated calls
